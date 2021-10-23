@@ -1,0 +1,644 @@
+---
+title: "MovieLens Recommendation System"
+author: "Ruth Parras"
+date: "10/18/2021"
+output: 
+  pdf_document:
+    number_sections: true
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo           = TRUE,    
+  message        = FALSE,   
+  warning        = FALSE)
+  
+options(scipen  =999)
+```
+
+```{r load, echo=FALSE}
+library(tidyverse)
+load("rdas/edx_str.rda")
+load("rdas/edx_counts.rda")
+load("rdas/results.rda")
+```
+------------------------------------------------------------------------
+# Introduction
+
+## Objective 
+
+This project builds an algorithm that predicts the ratings for a movie that a user has not yet seen, using ratings given by other people. This type of algorithm is known as "recommendation system" because predicted ratings are used to recommend other movies that a user might like. Recommendation systems are widely used not only in entertainment to rate movies or music but also in eCommerce to propose new items to add to a shopping cart. 
+
+## Dataset Description
+
+To develop our algorithm, we use the `edx` dataset which is a random 90% partition of the observations in the `MovieLens 10M` file that can be downloaded here: <https://grouplens.org/datasets/movielens/10m/>
+
+`edx` contains `r edx_counts$ratings` ratings of `r edx_counts$movies` movies by `r edx_counts$users` users. Ratings range from 0.5 to 5, with half point increments. Additional attributes include the title of the movie, genres, and timestamp of the rating.
+
+The remainder 10% of the observations (the `validation` set) is used at the end of the project to measure the performance of the algorithm using the residual mean squared error (RMSE).
+
+
+## Key Activities
+
+Following is an outline of the key steps performed in this project:  
+
+- After downloading and cleaning the data, we visualize relationships between movies, users, genres and time. We observe significant variations (biases or effects) in ratings from movie-to-movie, user-to-user, and across genres and time.
+
+- We use these insights to build an algorithm that estimates the rating for a movie as the average across all movies and users after adjusting for the variations that we observe above. Further, we also adjust for noisy estimates due to low number of ratings by using regularization.
+
+- To develop and train our model we use 90% of the observations in `edx` selected at random (the `train_set)`, while we set aside the remainder 10% (the `test_set`) to evaluate the algorithm using the residual mean squared error (RMSE).
+
+- Next, we use hierarchical clustering to uncover similarities in rating patterns by groups of users and movies. We leverage the Recommenderlab package and in particular the matrix factorization SVD algorithm to further improve our model.
+
+- Lastly, we use the `validation` set to run our final test. Results are then presented followed by conclusions and recommended next steps.
+
+
+# Analysis
+
+## Data Cleaning and Preparation
+
+We start by downloading the MovieLens 10M ratings file, which includes ratings.dat and movies.dat
+
+\small
+```{r dowload, echo=TRUE, eval=FALSE}
+
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", temp)
+
+```
+\normalsize
+
+Each line in ratings.dat represents one rating in the form UserID::MovieID::Rating::Timestamp. Likewise, each line of movies.dat represents one movie as MovieID::Title::Genres. After parsing the attributes into two tables, we join them into a dataframe, but exclude observations without ratings.
+
+Finally, we randomly partition the observations in MovieLens into two data sets:  
+
+-  `edx` containing 90% of the observations, used to build and test our algorithm 
+
+-  `validation` with the other 10%, used to conduct the final test at the end of the project 
+
+
+## Data Exploration and Visulization
+
+The `edx` set is a 90% random split of the $10M observations in `MovieLens`. Each observation consists on the rating of one movie, by one user, at a given time. The first few rows of `edx` look like this:
+
+\small
+```{r edx-structure, echo=FALSE, eval=TRUE}
+
+knitr::kable(edx_str)
+```
+\normalsize
+ \newline
+
+### Relationship between Movies and Ratings
+
+The first plot represents the number of ratings per movie. It is skewed towards lower counts, indicating that the majority of movies are infrequently rated. 
+
+The second plot shows large variations in average rating per movie, and is slightly skewed towards higher values. Likely the result of some "bias" in ratings favoring "blockbusters" or "main stream" productions.
+ \newline
+
+```{r movies_figures, echo=FALSE, out.width="45%"}
+
+knitr::include_graphics("figures/movie_counts.png")
+knitr::include_graphics("figures/movie_averages.png")
+
+```
+
+ \newline
+ 
+### Relationship between Users and Ratings
+
+Similarly, we display the number of ratings given by each user and its average. Again, the first plot is skewed towards lower counts, suggesting infrequent ratings, while the second chart is skewed towards higher averages, indicating some users are very generous in their evaluations.
+  \newline
+
+```{r user_figures, echo=FALSE, out.width="45%"}
+
+knitr::include_graphics("figures/user_counts.png")
+knitr::include_graphics("figures/user_averages.png")
+
+```
+
+  \newline
+
+### Relationship between Genre and Ratings
+
+Using a boxplot this time, we observe again high variability in ratings, with "horror" movies getting the lowest averages, while "film-noir" gets the best evaluations.
+
+
+```{r genre_figures, echo=FALSE, out.width="45%"}
+
+knitr::include_graphics("figures/genre_counts.png")
+knitr::include_graphics("figures/genre_averages.png")
+
+```
+
+### Relationship between Time and Ratings
+
+Lastly, we plot rating averages week-over-week and by day-of-the-week. 
+
+The first plot shows that average ratings have been trending down slowly since circa 1995 but started to bounce back around 2005. 
+
+The second chart shows ratings being slightly higher around weekends, suggesting that users moods (arguably, people tend to be more relaxed and happier on weekends) have an effect on ratings.
+  \newline
+
+```{r time_figures, echo=FALSE, out.width="45%"}
+
+knitr::include_graphics("figures/time_week.png")
+knitr::include_graphics("figures/time_weekday.png")
+
+```
+
+ \newline
+
+### Group Patterns  
+
+To explore if there are groups of users or movies with similar rating patterns, we use a subset of the data, `small_edx`, consisting of the 50 most rated movies and the users that have rated at least 25 of them.
+
+#### Clusters of Movies with similar rating patterns
+
+After normalizing `small_edx` by removing row and column averages, we calculate the distance between observations and use **hierarchical clustering** to group movies that are close together. Next, we summarize the information with a dendrogram 
+
+\small
+```{r movie_clusters, echo=TRUE, eval=FALSE}
+
+h <- dist(small_edx) %>% hclust()
+
+```
+\normalsize
+
+```{r m_cluster_plot, echo=FALSE, fig.align='center', out.width="70%", EVAL=TRUE}
+
+load("rdas/distance.rda")  
+h<- hclust(d)
+plot(h, cex = 0.6, main = "movie clusters", xlab ="", sub="")  # plot with a dendrogram
+
+```
+
+Ratings among users in the same dendrogram branch are closer together. In fact, if we cut the tree into 10 clusters and display group 3 and 5, for example, we can see similarities.
+
+\small
+```{r movie_groups, echo=TRUE, eval=TRUE}
+groups <- cutree(h, k = 10)  # generate  10 groups
+names(groups)[groups==3]   # family movies
+names(groups)[groups==5]   # blockbusters
+
+```
+\normalsize
+
+ \newline
+
+#### Clusters of Users with similar rating patterns
+
+This time, we only include the 25 users with the highest variability in ratings for whom movies are not the same. We transpose `small_edx` to calculate the distance between ratings and cluster users into groups with similar patterns.
+
+\small
+```{r user_clusters, echo=TRUE, eval=FALSE}
+
+h2 <- dist(t(small_edx)) %>% hclust() 
+
+```
+\normalsize
+
+```{r u_cluster_plot, echo=FALSE, fig.align='center', out.width="60%",  EVAL=TRUE}
+
+load("rdas/h2.rda")  
+plot(h2, cex = 0.65, main = "user clusters", xlab = "", sub="")  # plot with dendrogram
+
+```
+
+
+####  Clusters of movies and users 
+
+Finally, we visualize the combined clusters using a heatmap. Areas with the same shade represent groups of users and movies with similar rating patterns. Note large number of missing ratings (no color). 
+
+```{r heatmap,fig.align='center', out.width="55%", echo=FALSE}
+
+knitr::include_graphics("figures/heatmap.png")
+
+```
+
+## Insights
+
+Data exploration has proven very effective in uncovering rating patterns for movies, users and related attributes. Here is a summary of the insights:
+
+1. Rating averages are not uniform across movies, users, genres or time. Instead we observe strong variations or biases. 
+
+   +   Some movies are widely perceived as better and receive higher evaluations (**movie effect**)
+
+   +   Some users have a tendency to give higher or lower ratings (**user effect**)
+
+   +   Preferences in genre such as "action movies", that consistently score higher ratings (**genre effect**)
+
+   +   Variations in ratings based on the day of the week, and over time (**time effect**)
+
+2. Most movies have been infrequently rated and most users have given very few evaluations, which could skew predictions and lead to noisy estimates.
+
+3. There are groups of movies and groups of users with similar rating patterns, as validated using hierarchical clustering.
+
+In the next section we use these insights to build and improve our recommendation algorithm.
+
+
+
+# Modeling Approach
+
+We start by leveraging the insight that rating averages are not uniform across movies, users, genres and time, and build a model that adjusts for the different **effects**. 
+Next, we adjust for infrequent (noisy) ratings using **regularization**. 
+Finally, we use the **Recommenderlab** package to account for similarities in rating patterns for groups of users and movies.
+
+## Modeling for Effects
+
+### Average of Ratings
+
+We start with a basic model *Y~ui~* that predicts the same value *mu* for each movie *i* and user *u*
+
+> ***Y~ui~= mu + **e**~ui~***
+
+with *e~iu~* the random error that explains variations and *mu* the average of all known ratings:
+
+\small
+```{r mu, echo=TRUE, eval=FALSE}
+mu<- mean(train_set$rating)
+
+```
+\normalsize
+
+ 
+### Adjusting for Movie and User Effects  
+
+Next, we adjust for systemic differences (effects) in ratings by movie and users, represented as:
+
+>  ***Y~ui~= mu + b~i~ + b~u~ + e~ui~*** 
+
+with *b~i~* accounting for movie-to-movie variations in ratings, and *b~u~* user-to-user differences. After making predictions on the test_set, the RMSE is `r results$RMSE[3]`. Here is the code:
+
+\small
+```{r bi_bu, echo=TRUE, eval=FALSE}
+
+bis <- train_set %>%     # with bis the vector of bi (movie-to-movie variations)
+            group_by(movieId) %>% 
+            summarize(bi = mean(rating- mu))   
+
+bus <- train_set %>%   # with bus the vector of bu (user-to-user variations)
+            left_join(bis, by="movieId") %>%    
+            group_by(userId) %>% 
+            summarize(bu = mean(rating- mu- bi))   
+
+# make predictions for unknown ratings on the test_set using: Yui = mu + bi + bu
+predictions<- test_set %>%    #
+  left_join(bis, by="movieId") %>%
+  left_join(bus, by="userId") %>%
+  summarize(pred= mu + bi+ bu) %>%
+  pull(pred)
+
+RMSE<- sqrt(mean((test_set$rating - predictions)^2))  # calculate RMSE
+
+```
+\normalsize
+
+### Adjusting for Small Samples: Regularization
+
+As previously discussed, we need to penalize large estimates formed with a small number of ratings. This is achieved by adding a "penalty" *lambda* that shrinks estimates with few ratings, and by calculating the "regularized" *bi* and *bu* that minimize the RMSE. The model looks like this: 
+
+> ***Y~ui~= mu + reg_b~i~ + reg_b~u~ + e~ui~*** 
+
+and the lambda is estimated using cross-validation:
+
+\small
+```{r  reg_bi_bu, echo=TRUE, eval=FALSE}
+
+lambdas <- seq(0, 6, 0.05)   
+
+rmses <- sapply(lambdas, function(l){
+  mu<-mean(train_set$rating)
+  
+  reg_bis <- train_set%>%
+    group_by(movieId) %>%
+    summarize(reg_bi = sum(rating - mu)/(n()+l))
+  
+  reg_bus <- train_set %>%
+    left_join(reg_bis, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(reg_bu = sum(rating - reg_bi - mu)/(n()+l))
+  
+  predictions <-test_set %>%
+    left_join(reg_bis, by = "movieId") %>%
+    left_join(reg_bus, by = "userId") %>%
+    mutate(pred = mu + reg_bi + reg_bu) %>%
+    pull(pred)
+  
+  return(sqrt(mean((test_set$rating - predictions)^2))) 
+})
+
+```
+\normalsize
+
+
+```{r lambda_plot, echo=FALSE, out.width="50%", fig.align='center',  EVAL=TRUE}
+load("rdas/lambdas.rda")  
+load("rdas/rmses_l.rda")  
+
+lambda<- lambdas[which.min(rmses)] 
+qplot(lambdas, rmses)
+
+```
+The plot above shows that the lambda that minimizes the RMSE is `r lambda`, and the RMSE is `r results$RMSE[4]`
+
+### Adjusting for Genre and Time effects
+
+Finally, we adjust our model for systemic variations in ratings by genre (*g~ui~*) and day of the week (*d~ui~*). The augmented model is:
+
+> ***Y~ui~= mu + reg_b~i~ + reg_b~u~ + g~ui~ + d~ui~ +  e~ui~***
+
+After making predictions on the test_set, the RMSE is `r results$RMSE[6]`.
+
+\small
+```{r genre, echo=TRUE, eval=FALSE}
+
+guis <- train_set %>%   # vector of genre-to-genre variations in rating (gui)
+           left_join(reg_bis, by="movieId") %>%    
+           left_join(reg_bus, by="userID")
+           group_by(userId) %>% 
+           summarize(gui = mean(rating- mu- bi))   
+      
+duis<- train_set %>%    # vector of day-of-the-week variations in rating (dui)
+           left_join(reg_bis, by="movieId") %>%    
+           left_join(reg_bus, by="userId") %>%  
+           left_join(guis, by="genre1")  %>%
+           group_by(weekday) %>%
+           summarise(dui = mean(rating- mu- reg_bi- reg_bu- gui))    
+
+# predictions for unknown ratings using: Yui = mu + reg_bi + reg_bu + gui + dui
+predictions<- test_set %>%
+  mutate(date = as_datetime(timestamp),
+         week=round_date(date, "week")) %>%
+  left_join(reg_bis, by="movieId") %>%
+  left_join(reg_bus, by="userId") %>%
+  left_join(guis, by="genres") %>%
+  left_join(duis, by="week") %>%
+  summarize(pred= mu + reg_bi+ reg_bu + gui + dui) %>%
+  pull(pred)
+
+RMSE<- sqrt(mean((test_set$rating - predictions)^2))  # RMSE of the predictions  
+```
+\normalsize
+
+ \newline
+
+## Using Recommenderlab to account for Group Patterns
+
+Thus far, we have built a model that adjusts for different biases in ratings across movies, users, genres and time. Next, we leverage the insight that there are groups of movies and users with similar rating patterns and augment our model as follows:
+
+> ***Y~ui~= mu + reg_b~i~ + reg_b~u~ + g~ui~ + d~ui~ +  r~ui~ + e~ui~***
+
+with *r~ui~= p~u~q~i~* the residuals for user *u* and movie *i*, given by similarities in user (*p~u~*) and movie (*q~i~*) ratings
+
+We use **RecommenderLab's** implementation of the SVD approximation to decompose de original rating matrix using factorization, so that we can find the closest neighbors by similarities in ratings. 
+
+We start by adjusting ratings and removing all effects discussed in previous sections. The resulting "residuals" are transformed into a RealRatingMatrix, as required by Recommenderlab. 
+ \newline
+
+\small
+```{r residuals, echo=TRUE, eval=FALSE}
+
+# calculate the residuals for known ratings
+residual <- edx %>%  
+                mutate(date = as_datetime(timestamp),week=round_date(date, "week")) %>%
+                left_join(reg_bis, by="movieId") %>%
+                left_join(reg_bus, by= "userId") %>%
+                left_join(guis, by="genres") %>%
+                left_join(duis, by="week")
+                summarize(res= rating - (mu + reg_bi + reg_bu + gui + dui)) %>%
+                pull(res)
+
+ # transform into sparse matrix which is more efficient storing sparse data
+edx_matrix <- sparseMatrix(i = edx$userId, j = edx$movieId,  x = residual)
+
+# convert to realRatingMatrix as required by Recommenderlab
+edx_realMatrix <- as(edx_matrix, "realRatingMatrix")
+```
+\normalsize
+
+Here are the residuals for the first 100 users and movies. Note the sparsity (missing ratings) of the matrix
+
+\small
+```{r rm_image, out.width="55%", fig.align='center', echo=FALSE}
+
+knitr::include_graphics("figures/edx_realMatrix.png")
+```
+\normalsize
+
+To improve the performance of Recommenderlab, we train our algorithm with users who have rated at least 50 movies, under the assumption that "frequent users" give more robust ratings that lead to better predictions. 
+
+Next we use Recommenderlab built-in function to partition the data into a train, test and error set. 
+
+\small
+```{r evaluationScheme, echo=TRUE, eval=FALSE}
+
+# train Recommenderlab with "frequent" users who have rated at least 50 movies 
+frequent_users <- edx_realMatrix[rowCounts(edx_realMatrix) >= 50 ]
+
+# partition data into train, test and error sets, and withhold 30 ratings for evaluation
+set.seed(123, sample.kind="Rounding") 
+frequent_users_split <- evaluationScheme(frequent_users, method="split", train= 0.9, given=30)
+train_set<- getData(frequent_users_split, "train")  
+test_set <- getData(frequent_users_split, "known")  
+error_set <- getData(frequent_users_split, "unknown")  
+```
+\normalsize
+
+Finally, we train Recommenderlab's SVD algorithm by tuning for the k-neighbors that minimize Recommenderlab built-in RMSE function:
+
+\small
+```{r Recommender, echo=TRUE, eval=FALSE}
+
+k_tune <- seq(30,45, 1)
+
+rmses <- sapply(k_tune, function(k){
+  model_svd <- Recommender(train_set, method="SVD", param=list(k=k))
+  predictions <- predict(model_svd, test_set, type="ratings" )
+  RMSE<- calcPredictionAccuracy(predictions, error_set)["RMSE"]
+  return(RMSE)
+})
+```
+\normalsize
+
+```{r k_plot, echo=FALSE, out.width="50%", fig.align='center',  eval=TRUE}
+load("rdas/k_tune.rda")  
+load("rdas/rmses_k.rda")  
+
+k_opt<- k_tune[which.min(rmses)]
+RMSE<- min(rmses)
+qplot(k_tune, rmses)
+
+```
+
+The plot above shows that the k that minimizes RMSE is `r k_opt`, and the RMSE of the model is `r round(RMSE,5)`
+
+
+# Results
+
+In this section we perform the final test on the validation set for the **Effects model** and the **Recommenderlab approach**.  Then we discuss the modeling results and overall performance. 
+
+## Final test on the Validation set
+
+### Effects Model
+
+The RMSE returned by testing the predictions of our Effects model on the validation set is `r results$RMSE[8]`. This is the value we are submitting for this project since it is below the target of 0.86490. 
+
+Here is the snipped of code used for the final test on the validation set:
+
+\small
+```{r, final_effects, echo=TRUE, eval=FALSE}
+# use the full edx set to recalculate reg_bi, reg_bu, gui and dui. 
+# make predictions on the validation set with Yui = mu + reg_bi + reg_bu + gui + dui
+
+predictions<- validation %>%
+  mutate(date = as_datetime(timestamp), week=round_date(date, "week")) %>%
+  left_join(reg_bis, by="movieId") %>%
+  left_join(reg_bus, by="userId") %>%
+  left_join(guis, by="genres") %>%
+  left_join(duis, by="week") %>%
+  summarize(pred= mu + reg_bi+ reg_bu + gui + dui ) %>%
+  pull(pred)
+
+RMSE<- sqrt(mean((validation$rating - predictions)^2))  # RMSE on validation set
+```
+\normalsize
+
+
+### Recommenderlab SVD Model
+
+As a stretch goal for this project, we have also developed a model that uses Recommenderlab's SVD algorithm to account for groups of movies and users with similar ratings. Surprisingly, the RMSE returned on the validation set, `r results$RMSE[9]`, was considerably above target. 
+
+Below is a snipped of the proposed code. In practice, we had to break the users rating matrix into several chunks to optimize for memory allocation and expedite processing (code not shown for simplicity, but available in the R script). 
+
+\small
+```{r final_recommender, eval=FALSE, echo=TRUE}
+
+# fit the SVD model for "frequent users", with k_opt that minimizes RMSE
+frequent_users <- edx_realMatrix[rowCounts(edx_realMatrix) >= 50 ] 
+model_svd <- Recommender(frequent_users, method="SVD", param=list(k=k_opt) )
+
+# predict unknown residuals for frequent users 
+preds_realMatrix <- predict(model_svd, frequent_users, type="ratingMatrix") 
+
+# transform RealRatingsMatrix into a matrix and then a dataframe.  
+preds_matrix <- getRatingMatrix(preds_realMatrix)
+userId <-as.integer(rownames(preds_matrix))
+movieId<- as.integer(colnames(preds_matrix))
+residual<- as.vector(preds_matrix)
+
+res_freq_users<- data.frame(userId, movieId, residual) 
+  
+# as above for "infrequent users" who rated less than 50 movies
+infrequent_users <- edx_realMatrix[rowCounts(edx_realMatrix) <50, ]
+preds_realMatrix <- predict(model_svd, infrequent_users, type="ratings")
+
+preds_matrix <- getRatingMatrix(preds_realMatrix)
+userId<-as.integer(rownames(preds_matrix))
+movieId<- as.integer(colnames(preds_matrix))
+residual<- as.vector(preds_matrix)
+
+res_infreq_users <- data.frame(userId, movieId, residual) 
+
+# Combine residuals from "frequent" and "infrequent" users
+res<- rbind (res_freq_users, res_infreq_users)
+
+# make predictions on validation set: Yui = mu + reg_bi + reg_bu + gui + dui + residual
+predictions<- validation %>%
+    mutate(date = as_datetime(timestamp),week=round_date(date, "week")) %>%
+    left_join(reg_bis, by="movieId") %>%
+    left_join(reg_bus, by="userId") %>%
+    left_join(guis, by="genres") %>%
+    left_join(duis, by="week") %>%
+    left_join(res, by=c("movieId", "userId")) %>%
+    mutate (pred= mu + reg_bi + reg_bu + gui + dui + residual) %>%
+    pull(pred)
+
+RMSE<- sqrt(mean((validation$rating - predictions)^2))  # RMSE on validation set
+```
+\normalsize
+
+
+## Modeling Results and Overall Performance
+
+The following table presents the results of each iteration in our model, including the final tests on the validation set for the two proposed models.
+
+\small
+```{r results, echo=FALSE}
+
+knitr::kable(results)
+
+```
+\normalsize
+
+We started with a basic model that predicted the same value calculated as the average of all known ratings, which had a RMSE of `r results$RMSE[1]` on the test set. As we adjusted for movie and user biases, we saw progressive but smaller improvements ( `r round(results$RMSE[2]-results$RMSE[1],5)` and `r round(results$RMSE[3]-results$RMSE[2],5)`, respectively) . 
+
+Surprisingly, regularization of small sample sizes for movies and users led to a very minor improvement of the RMSE , down `r round(results$RMSE[4]-results$RMSE[3],5)`. Even less remarkable were the adjustments for genres and time effects: `r round(results$RMSE[5]-results$RMSE[4],5)` and `r round(results$RMSE[6]-results$RMSE[5],5)`, respectively.
+
+Combined, the overall RMSE for the **all the effects model** was `r results$RMSE[6]` on the test set and `r results$RMSE[8]` on the validation set, both below the required target of 0.86490. As expected, the two values were very close, suggesting that there was no over-training. 
+
+**The RMSE we are submitting for this project is `r results$RMSE[8]`, as measured on the validation set**
+
+
+As a stretch goal, we have used **Recommenderlab's SVD algorithm** to model for groups of users and movies with similarities in ratings. We have removed previously identified effects from known ratings before processing the data with Recommenderlab to predict the remaining "residuals". 
+
+While the RMSE calculated on the testing set during the development phase was encouraging (`r results$RMSE[7]`), the final test on the validation set returned `r results$RMSE[9]`, well above target. 
+
+This regression in performance (+`r round(results$RMSE[9]-results$RMSE[7],5)`)  was likely the result of having had to reduce the size of the edx matrix so that it could be processed by Recommenderlab, rather than using all available ratings. 
+
+A faster PC with more memory and compute power that could handle the entire edx matrix might have led to better results. 
+
+
+# Conclusion
+
+## Summary
+
+We have built an algorithm that predicts ratings for a movie that a user has not yet seen, using ratings given by other people.
+
+Data exploration has showcased that ratings are not uniform. Instead, they are subjected to strong effects associated with perceptions (some movies are widely perceived as better), user behavior (some users have a tendency to give higher or lower ratings), preferences (such as "action" movies vs. "comedies") and time. 
+
+**Modeling for effects** has proven not only very effective but also very insightful in confirming that movies are not rated at random. It led to a RMSE of `r results$RMSE[8]` on the validation set, below the targeted 0.86490
+
+Surprisingly, our observation of groups of movies and users with similar rating patterns, and hence the assumption that users that agree on the ratings for some movies might also agree on their evaluation for others, has not led to better predictions.
+
+We have used **RecommenderLab**'s implementation of the **SVD approximation** to find the closest neighbors by similarities in ratings, after adjusting for all previously uncovered effects.
+
+Although the performance on the test set calculated by Recommenderlab's built-in RMSE function was promising (RMSE was `r results$RMSE[7]`), we have observed a significant deterioration when testing on the validation set  (RMSE of `r results$RMSE[9]`). Therefore, we did not submit this value as the resulting RMSE for this project. Instead, we are proposing several opportunities for improvement in the next sections.  
+
+
+
+## Limitations
+
+**Modeling for effects** has proven to be very effective not only from a performance perspective as measured by RMSE, but also in terms of speed and memory use. 
+
+In contrast, **Recommenderlab** is easy to implement, but it is computationally expensive, and does not seem to work well with very large and sparse matrices. 
+
+To make predictions for a group of users, the algorithm needs to process all movies, whether rated or not. Tuning for k-neighbors, which requires the evaluation of each pair of users and movies was very time consuming.
+
+Further, to train the algorithm on a regular computer with 16 GB memory, we had to reduce the size of the rating matrix before it could be processed by Recommenderlab. 
+
+Rather than selecting observations at random (which preserves the distribution of the original population), we chose to focus on frequent users (those that have rated at least 50 movies) under the assumption that they give more robust ratings that lead to better predictions. 
+
+But this left us with a set of infrequent users, for which ratings were more sparse, and therefore the performance of Recommenderlab was far worse.
+
+Later, in order to obtain the final predictions on the validation set, we had to further break the matrices of frequent and infrequent users into several chunks so that they could be processed by Recommenderlab. Again, very inefficient and time consuming. 
+ 
+
+## Future Work
+
+There are opportunities to improve results by using a more powerful computer that can process the entire edx set using Recommenderlab.
+
+Alternatively, we could use random sampling or tuning Recommenderlab for the cutoff for user frequency (for this project, the limit was preset at users with at least 50 ratings) or a combination or both. 
+
+Further, we could improve scalability by reducing dimensions using Pricipal Component Analysis (PCA). 
+
+In addition to the SVD implementation that was used here, there are opportunities to compare the performance of other algorithms in Recommenderlab such as user-based collaborative filtering (UBCF), item-based collaborative filtering (IBCF) or Funk-SVD. 
+
+Also of interest would be to compare results using other libraries in R for recommender systems such as rrecsys or recosystem (see https://gist.github.com/talegari/77c90db326b4848368287e53b1a18e8d )
+
+
+
+# References
+
+-  edx course reference book: https://rafalab.github.io/dsbook/
+-  Recommenderlab package documentation: https://cran.r-project.org/web/packages/recommenderlab/recommenderlab.pdf
+-  Recommenderlab vignettes: https://cran.r-project.org/web/packages/recommenderlab/vignettes/recommenderlab.pdf
+-  Libraries for recommender systems: https://gist.github.com/talegari/77c90db326b4848368287e53b1a18e8d
